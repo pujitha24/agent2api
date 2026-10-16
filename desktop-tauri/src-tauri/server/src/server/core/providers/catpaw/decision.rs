@@ -69,6 +69,8 @@ pub(super) struct Decision {
     pub(super) session: Option<SessionRecord>,
     /// 工具续接时提交的那条 tool 消息
     pub(super) continuation: Option<Value>,
+    /// `round_messages` 末尾是网关补的合成 user 消息（不在客户端历史里，不进指纹链）
+    pub(super) synthetic_tail: bool,
 }
 
 /// 轮次判定（原实现 `streamRequest` 开头那一段，**顺序照抄**）
@@ -102,14 +104,34 @@ pub(super) fn decide(
         return Err(CatPawError::bad_request("tool_call_id 命中多个待处理工具会话"));
     }
     if let Some(session) = hits.into_iter().next() {
-        let continuation = continuation_message(raw_messages, &session)?;
-        return Ok(Decision {
-            mode: TurnMode::ToolContinuation,
-            conversation_id: session.conversation_id.clone(),
-            round_messages: None,
-            session: Some(session),
-            continuation: Some(continuation),
-        });
+        match continuation_message(raw_messages, &session)? {
+            Some(continuation) => {
+                return Ok(Decision {
+                    mode: TurnMode::ToolContinuation,
+                    conversation_id: session.conversation_id.clone(),
+                    round_messages: None,
+                    session: Some(session),
+                    continuation: Some(continuation),
+                    synthetic_tail: false,
+                });
+            }
+            None => {
+                // 客户端改写了待响应的 tool_call 集合（如把一个批量 tool_call 展开成
+                // 多个子调用，子调用 id 是客户端本地合成的）：与 sync-mismatch 同理，
+                // 作废旧会话后按规则 3 全量重建，而不是 400
+                logging::verbose(
+                    "[CatPaw]",
+                    &format!(
+                        "会话 {} 的 tool_call 集合与客户端不一致，作废后全量重建",
+                        short_id(&session.conversation_id),
+                    ),
+                );
+                registry.invalidate_by_conversation(
+                    &session.conversation_id,
+                    InvalidationReason::SyncMismatch,
+                );
+            }
+        }
     }
 
     // ── 规则 2：长会话新轮次（x-session-id 命中注册表）────────────
@@ -134,6 +156,7 @@ pub(super) fn decide(
                             round_messages: Some(increment),
                             session: Some(session),
                             continuation: None,
+                            synthetic_tail: false,
                         });
                     }
                     ChainPosition::Mismatch => {
@@ -160,12 +183,25 @@ pub(super) fn decide(
     }
 
     // ── 规则 3：全新会话（全量 round）────────────────────────────
+    // 上游要求 round 的最后一条必须是 user：历史以 tool 结果结尾时（重建自工具
+    // 续接、或网关重启丢了注册表后客户端重放）补一条合成 user 消息，只进本轮提交
+    let mut round_messages = prepared.messages.clone();
+    let synthetic_tail = round_messages.last().and_then(|m| m.get("type")).and_then(Value::as_str) == Some("tool");
+    if synthetic_tail {
+        round_messages.push(serde_json::json!({
+            "type": "user",
+            "messageId": new_request_id(),
+            "content": [{"type": "text", "text": "继续"}],
+            "finished": true,
+        }));
+    }
     Ok(Decision {
         mode: TurnMode::NewRound,
         conversation_id: new_request_id(),
-        round_messages: Some(prepared.messages.clone()),
+        round_messages: Some(round_messages),
         session: None,
         continuation: None,
+        synthetic_tail,
     })
 }
 
@@ -243,12 +279,14 @@ pub(super) fn pending_call_ids(messages: &[Value]) -> Vec<String> {
 /// 原实现用会话里存的 `toolCalls` 回填 `toolName`，这里改成从**本次请求历史**
 /// 里那条 assistant 消息的 `tool_calls` 取 —— 两者是同一批数据（会话里那份就是
 /// 上一轮上游返回、被客户端回显的），而本次请求的值不会过期。
+/// 返回 `Ok(None)` = 客户端回传的 tool_result 集合与注册表待响应集合不一致
+/// （客户端合法改写了历史），调用方应作废会话后全量重建，而不是报错。
 /// 回填是必需的：toolName 进指纹（`fingerprint.rs`），缺了会让客户端下一轮回显
 /// 的 tool 消息与注册表指纹对不上，误判「历史被改写」而全量重建。
 pub(super) fn continuation_message(
     raw_messages: &[Value],
     session: &SessionRecord,
-) -> Result<Value, CatPawError> {
+) -> Result<Option<Value>, CatPawError> {
     let Some(start) = pending_tool_call_start(raw_messages) else {
         return Err(CatPawError::bad_request(
             "工具结果续接请求缺少对应的 assistant tool_calls",
@@ -314,19 +352,19 @@ pub(super) fn continuation_message(
         }
         rewritten.push(block);
     }
-    // 待响应集合必须与实际提交的 tool_result 完全一致（原实现同）
-    if session.pending_call_ids.len() != seen.len()
-        || session.pending_call_ids.iter().any(|id| !seen.contains(id))
-    {
-        return Err(CatPawError::bad_request(
-            "tool_result 与待处理的 assistant tool_calls 不一致",
-        ));
+    // 待响应集合与实际提交的 tool_result 不一致 → 交给调用方重建
+    if !pending_matches(&session.pending_call_ids, &seen) {
+        return Ok(None);
     }
     let Some(mut object) = message.as_object().cloned() else {
         return Err(CatPawError::bad_request("工具结果续接请求缺少 tool 消息"));
     };
     object.insert("content".to_string(), Value::Array(rewritten));
-    Ok(Value::Object(object))
+    Ok(Some(Value::Object(object)))
+}
+
+fn pending_matches(pending: &[String], seen: &[String]) -> bool {
+    pending.len() == seen.len() && pending.iter().all(|id| seen.contains(id))
 }
 
 /// 本轮「实际提交给上游」的消息指纹（写回指纹链用）。
@@ -335,11 +373,63 @@ pub(super) fn continuation_message(
 /// 否则下一次  会在客户端历史里定位到错误的位置。
 pub(super) fn submitted_fingerprints(decision: &Decision) -> Vec<String> {
     let mut submitted = match &decision.round_messages {
-        Some(messages) => super::fingerprint::fingerprints_for(messages),
+        Some(messages) => {
+            let real = messages.len() - usize::from(decision.synthetic_tail);
+            super::fingerprint::fingerprints_for(&messages[..real])
+        }
         None => Vec::new(),
     };
     if let Some(continuation) = &decision.continuation {
         submitted.push(super::fingerprint::message_fingerprint(continuation));
     }
     submitted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn record(pending: &[&str]) -> SessionRecord {
+        SessionRecord {
+            conversation_id: "conv".to_string(),
+            fingerprints: Vec::new(),
+            model_type: 1,
+            account_id: String::new(),
+            created_at: 0,
+            last_active_at: 0,
+            inflight: false,
+            session_id: String::new(),
+            pending_call_ids: pending.iter().map(|id| id.to_string()).collect(),
+            turn_request_id: None,
+        }
+    }
+
+    fn history(ids: &[&str]) -> Vec<Value> {
+        let calls: Vec<Value> = ids
+            .iter()
+            .map(|id| json!({"id": id, "type": "function", "function": {"name": "t", "arguments": "{}"}}))
+            .collect();
+        let mut messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "", "tool_calls": calls}),
+        ];
+        for id in ids {
+            messages.push(json!({"role": "tool", "tool_call_id": id, "content": "ok"}));
+        }
+        messages
+    }
+
+    #[test]
+    fn matching_call_ids_continue() {
+        let out = continuation_message(&history(&["a", "b"]), &record(&["a", "b"])).unwrap();
+        assert!(out.is_some());
+    }
+
+    #[test]
+    fn client_expanded_call_ids_diverge_instead_of_400() {
+        // 注册表只有上游发的 1 个 id，客户端展开成 3 个（后两个是本地合成的）
+        let out = continuation_message(&history(&["a", "call_1", "call_2"]), &record(&["a"]));
+        assert!(matches!(out, Ok(None)));
+    }
 }
